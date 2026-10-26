@@ -19,6 +19,13 @@ A personal prayer and Quran tilawat tracker. The UI is static HTML/CSS/JavaScrip
 - Phone: create a Firebase project and web app, enable Phone Number sign-in in Firebase Authentication, authorize your Vercel domain, and allow the SMS regions you want to support. Set `FIREBASE_API_KEY`, `FIREBASE_AUTH_DOMAIN`, `FIREBASE_PROJECT_ID`, and `FIREBASE_APP_ID` in Vercel from the Firebase web app config. Firebase handles reCAPTCHA and SMS verification; Daybook validates the resulting Firebase ID token before opening its own session. Firebase currently does not bill the first 10 verification SMS sent per day, but production phone auth requires a billing account and additional SMS can be charged.
 - Add these values to the relevant Vercel environments and redeploy. Google and phone sign-in use the shared Firebase config. Firebase phone sign-in requires an authorized web domain; use a deployed authorized domain for phone testing.
 
+### Email OTP for new accounts
+
+- New email/password registrations require a six-digit email code. Google sign-in uses Google's verified email identity, and phone sign-in uses Firebase's verified SMS flow.
+- Use a Gmail account for sending. Turn on 2-Step Verification for that account, create an App Password in the Google Account security settings, then add `SMTP_EMAIL` (the Gmail address) and `SMTP_APP_PASSWORD` (the 16-character App Password) to Vercel. Do not use your regular Google password. Google Workspace accounts may have App Passwords disabled by an administrator.
+- Set `OTP_SECRET` to a private random value of at least 32 characters. For PowerShell, generate one with: `[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))`. Store it only as a Vercel environment variable, then redeploy.
+- Codes expire after 10 minutes. Each code allows five guesses; requests are limited to one per minute and five per email per hour. Gmail imposes account-specific sending limits, so this setup is best for modest email volume.
+
 Never put `MONGODB_URI` in `app.js`, `index.html`, or any other browser-delivered file. The app only uses it inside Python API functions.
 
 ## Local development

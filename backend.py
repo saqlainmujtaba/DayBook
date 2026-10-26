@@ -7,9 +7,12 @@ import json
 import os
 import re
 import secrets
+import smtplib
+import ssl
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
+from email.message import EmailMessage
 from http import cookies
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlencode, urlparse
@@ -50,6 +53,8 @@ def database():
                 db.users.create_index([("firebase_uid", ASCENDING)], unique=True, sparse=True)
                 db.sessions.create_index([("token_hash", ASCENDING)], unique=True)
                 db.sessions.create_index([("expires_at", ASCENDING)], expireAfterSeconds=0)
+                db.email_verifications.create_index([("email", ASCENDING)], unique=True)
+                db.email_verifications.create_index([("expires_at", ASCENDING)], expireAfterSeconds=0)
                 db.prayers.create_index([("user_id", ASCENDING), ("date", ASCENDING), ("prayer", ASCENDING)], unique=True)
                 db.quran_sessions.create_index([("user_id", ASCENDING), ("date", DESCENDING), ("created_at", DESCENDING)])
                 _indexes_ready = True
@@ -198,7 +203,7 @@ class ApiMixin:
         endpoint = self._endpoint()
         allowed = {
             "me": {"GET"}, "data": {"GET", "DELETE"}, "export": {"GET"},
-            "register": {"POST"}, "login": {"POST"}, "logout": {"POST"},
+            "register-code": {"POST"}, "register-verify": {"POST"}, "login": {"POST"}, "logout": {"POST"},
             "profile": {"PATCH"}, "prayers": {"POST"}, "sessions": {"POST"},
             "firebase-login": {"POST"}, "firebase-config": {"GET"}, "phone-verify": {"POST"},
         }
@@ -214,6 +219,10 @@ class ApiMixin:
             self.respond(400, {"error": str(error)})
             return
         try:
+            if endpoint == "register-code":
+                self.send_registration_code(body); return
+            if endpoint == "register-verify":
+                self.verify_registration_code(body); return
             if endpoint == "firebase-login":
                 self.firebase_login(body); return
             if endpoint == "firebase-config":
@@ -238,21 +247,6 @@ class ApiMixin:
             return
 
         db = database()
-        if endpoint == "register":
-            email = str(body.get("email", "")).strip().lower()
-            password = body.get("password", "")
-            name = str(body.get("name", "")).strip()[:32]
-            if len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-                self.respond(400, {"error": "Enter a valid email address."}); return
-            if not isinstance(password, str) or len(password) < 10 or len(password) > 200:
-                self.respond(400, {"error": "Use a password between 10 and 200 characters."}); return
-            try:
-                user_id = db.users.insert_one({"email": email, "name": name, "password_hash": hash_password(password), "created_at": datetime.now(timezone.utc)}).inserted_id
-            except DuplicateKeyError:
-                self.respond(409, {"error": "An account with that email already exists. Sign in instead."}); return
-            user = db.users.find_one({"_id": user_id})
-            self.create_session(db, user, 201); return
-
         if endpoint == "login":
             email = str(body.get("email", "")).strip().lower()
             password = body.get("password", "")
@@ -319,6 +313,117 @@ class ApiMixin:
         expiry = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
         db.sessions.insert_one({"token_hash": token_hash(token), "user_id": user["_id"], "expires_at": expiry})
         self.respond(status, {"user": public_user(user)}, self.session_cookie(token, int(expiry.timestamp())))
+
+    def registration_email(self, value):
+        email = str(value or "").strip().lower()
+        if len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            self.respond(400, {"error": "Enter a valid email address."})
+            return None
+        return email
+
+    def send_registration_code(self, body):
+        email = self.registration_email(body.get("email"))
+        if not email:
+            return
+        password = body.get("password", "")
+        name = str(body.get("name", "")).strip()[:32]
+        if not isinstance(password, str) or len(password) < 10 or len(password) > 200:
+            self.respond(400, {"error": "Use a password between 10 and 200 characters."})
+            return
+        smtp_email = os.environ.get("SMTP_EMAIL")
+        smtp_app_password = os.environ.get("SMTP_APP_PASSWORD")
+        otp_secret = os.environ.get("OTP_SECRET")
+        if not smtp_email or not smtp_app_password or not otp_secret:
+            self.respond(503, {"error": "Email verification is not configured yet. Add the Gmail SMTP and OTP settings to the server."})
+            return
+
+        db = database()
+        if db.users.find_one({"email": email}):
+            self.respond(409, {"error": "An account with that email already exists. Sign in instead."})
+            return
+        now = datetime.now(timezone.utc)
+        pending = db.email_verifications.find_one({"email": email})
+        if pending:
+            last_sent = pending.get("last_sent_at")
+            if last_sent and now - last_sent < timedelta(seconds=60):
+                self.respond(429, {"error": "Wait a minute before requesting another code."})
+                return
+            send_times = [stamp for stamp in pending.get("send_times", []) if now - stamp < timedelta(hours=1)]
+            if len(send_times) >= 5:
+                self.respond(429, {"error": "Too many codes requested for this email. Try again in an hour."})
+                return
+        else:
+            send_times = []
+
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        code_hash = hmac.new(otp_secret.encode(), f"{email}:{code}".encode(), hashlib.sha256).hexdigest()
+        expires_at = now + timedelta(minutes=10)
+        db.email_verifications.update_one(
+            {"email": email},
+            {"$set": {"code_hash": code_hash, "name": name, "password_hash": hash_password(password), "created_at": now, "last_sent_at": now, "expires_at": expires_at, "attempts": 0, "send_times": send_times + [now]}},
+            upsert=True,
+        )
+        message = EmailMessage()
+        message["From"] = f"Daybook <{smtp_email}>"
+        message["To"] = email
+        message["Subject"] = "Your Daybook verification code"
+        message.set_content(f"Your Daybook verification code is {code}. It expires in 10 minutes. If you did not request this, you can ignore this email.")
+        message.add_alternative(
+            f"<div style=\"font-family:Arial,sans-serif;max-width:480px;margin:0 auto;color:#21382f\"><h2>Verify your email</h2><p>Enter this code in Daybook to finish creating your account:</p><p style=\"font-size:30px;font-weight:700;letter-spacing:8px\">{code}</p><p>This code expires in 10 minutes. If you did not request it, you can ignore this email.</p></div>",
+            subtype="html",
+        )
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=12) as smtp:
+                smtp.login(smtp_email, smtp_app_password.replace(" ", ""))
+                smtp.send_message(message)
+        except (smtplib.SMTPException, OSError, ValueError):
+            db.email_verifications.delete_one({"email": email, "code_hash": code_hash})
+            self.respond(502, {"error": "Could not send the verification email. Check the Gmail address and App Password."})
+            return
+        self.respond(200, {"ok": True, "message": "If this address can be registered, a verification code has been sent."})
+
+    def verify_registration_code(self, body):
+        email = self.registration_email(body.get("email"))
+        if not email:
+            return
+        code = str(body.get("code", "")).strip()
+        if not re.fullmatch(r"\d{6}", code):
+            self.respond(400, {"error": "Enter the six-digit code from your email."})
+            return
+        otp_secret = os.environ.get("OTP_SECRET")
+        if not otp_secret:
+            self.respond(503, {"error": "Email verification is not configured yet."})
+            return
+        db = database()
+        pending = db.email_verifications.find_one({"email": email})
+        now = datetime.now(timezone.utc)
+        if not pending or pending.get("expires_at") <= now:
+            if pending:
+                db.email_verifications.delete_one({"_id": pending["_id"]})
+            self.respond(400, {"error": "That code expired. Request a new one and try again."})
+            return
+        if pending.get("attempts", 0) >= 5:
+            db.email_verifications.delete_one({"_id": pending["_id"]})
+            self.respond(429, {"error": "Too many incorrect attempts. Request a new code."})
+            return
+        expected = hmac.new(otp_secret.encode(), f"{email}:{code}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, pending.get("code_hash", "")):
+            db.email_verifications.update_one({"_id": pending["_id"]}, {"$inc": {"attempts": 1}})
+            self.respond(401, {"error": "That code is incorrect. Check it and try again."})
+            return
+        if db.users.find_one({"email": email}):
+            db.email_verifications.delete_one({"_id": pending["_id"]})
+            self.respond(409, {"error": "An account with that email already exists. Sign in instead."})
+            return
+        try:
+            user_id = db.users.insert_one({"email": email, "name": pending.get("name", ""), "password_hash": pending["password_hash"], "email_verified": True, "created_at": now}).inserted_id
+        except DuplicateKeyError:
+            db.email_verifications.delete_one({"_id": pending["_id"]})
+            self.respond(409, {"error": "An account with that email already exists. Sign in instead."})
+            return
+        db.email_verifications.delete_one({"_id": pending["_id"]})
+        self.create_session(db, db.users.find_one({"_id": user_id}), 201)
 
     def firebase_config(self):
         keys = {"apiKey": "FIREBASE_API_KEY", "authDomain": "FIREBASE_AUTH_DOMAIN", "projectId": "FIREBASE_PROJECT_ID", "appId": "FIREBASE_APP_ID"}

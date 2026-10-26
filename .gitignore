@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.vercel/
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal

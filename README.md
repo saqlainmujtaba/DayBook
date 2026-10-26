@@ -13,6 +13,12 @@ A personal prayer and Quran tilawat tracker. The UI is static HTML/CSS/JavaScrip
    - `MONGODB_DB` — `daybook` (optional; this is the default).
 6. Redeploy, open the Vercel URL and create an account.
 
+### Google and phone sign-in
+
+- Google: enable the Google provider under Firebase Authentication’s sign-in providers. The same Firebase web app config used for phone sign-in powers Google sign-in, so Daybook does not need a separate Google OAuth client or Google client secrets. Ensure your deployed domain is listed under Firebase Authentication’s authorized domains.
+- Phone: create a Firebase project and web app, enable Phone Number sign-in in Firebase Authentication, authorize your Vercel domain, and allow the SMS regions you want to support. Set `FIREBASE_API_KEY`, `FIREBASE_AUTH_DOMAIN`, `FIREBASE_PROJECT_ID`, and `FIREBASE_APP_ID` in Vercel from the Firebase web app config. Firebase handles reCAPTCHA and SMS verification; Daybook validates the resulting Firebase ID token before opening its own session. Firebase currently does not bill the first 10 verification SMS sent per day, but production phone auth requires a billing account and additional SMS can be charged.
+- Add these values to the relevant Vercel environments and redeploy. Google and phone sign-in use the shared Firebase config. Firebase phone sign-in requires an authorized web domain; use a deployed authorized domain for phone testing.
+
 Never put `MONGODB_URI` in `app.js`, `index.html`, or any other browser-delivered file. The app only uses it inside Python API functions.
 
 ## Local development
@@ -35,5 +41,5 @@ Open <http://127.0.0.1:8000>.
 
 ## Database collections
 
-The API creates the required indexes on first use. Data is held in `users`, `sessions`, `prayers`, and `quran_sessions` collections. Prayer and Quran records are scoped to the authenticated account ID. Passwords are salted PBKDF2 hashes; session tokens are stored as hashes and sent to the browser only in HTTP-only cookies.
+The API creates the required indexes on first use. Data is held in `users`, `sessions`, `prayers`, and `quran_sessions` collections. Prayer and Quran records are scoped to the authenticated account ID. Passwords are salted PBKDF2 hashes; session tokens are stored as hashes and sent to the browser only in HTTP-only cookies. Google and phone accounts use Firebase user IDs, and phone accounts are created only after Firebase verifies the number.
 

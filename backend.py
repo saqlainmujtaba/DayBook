@@ -12,7 +12,9 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from bson import ObjectId
 from pymongo import MongoClient, ASCENDING, DESCENDING
@@ -43,6 +45,9 @@ def database():
         with _client_lock:
             if not _indexes_ready:
                 db.users.create_index([("email", ASCENDING)], unique=True)
+                db.users.create_index([("phone", ASCENDING)], unique=True, sparse=True)
+                db.users.create_index([("google_sub", ASCENDING)], unique=True, sparse=True)
+                db.users.create_index([("firebase_uid", ASCENDING)], unique=True, sparse=True)
                 db.sessions.create_index([("token_hash", ASCENDING)], unique=True)
                 db.sessions.create_index([("expires_at", ASCENDING)], expireAfterSeconds=0)
                 db.prayers.create_index([("user_id", ASCENDING), ("date", ASCENDING), ("prayer", ASCENDING)], unique=True)
@@ -83,7 +88,8 @@ def token_hash(token):
 
 
 def public_user(user):
-    return {"id": str(user["_id"]), "email": user["email"], "name": user.get("name", "")}
+    email = user.get("email", "")
+    return {"id": str(user["_id"]), "email": "" if email.endswith("@phone.daybook.invalid") else email, "phone": user.get("phone", ""), "name": user.get("name", ""), "identifier": user.get("phone") or email}
 
 
 def valid_origin(handler):
@@ -117,6 +123,14 @@ class ApiMixin:
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(raw)
+
+    def provider_request(self, url, data=None, headers=None):
+        request = Request(url, data=data, headers=headers or {})
+        try:
+            with urlopen(request, timeout=12) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, ValueError) as error:
+            raise ValueError("The sign-in provider could not verify the request. Please try again.") from error
 
     def read_json(self):
         try:
@@ -186,6 +200,7 @@ class ApiMixin:
             "me": {"GET"}, "data": {"GET", "DELETE"}, "export": {"GET"},
             "register": {"POST"}, "login": {"POST"}, "logout": {"POST"},
             "profile": {"PATCH"}, "prayers": {"POST"}, "sessions": {"POST"},
+            "firebase-login": {"POST"}, "firebase-config": {"GET"}, "phone-verify": {"POST"},
         }
         if method not in allowed.get(endpoint, set()):
             self.respond(404 if endpoint not in allowed else 405, {"error": "API endpoint not found." if endpoint not in allowed else "Method not allowed."})
@@ -199,6 +214,12 @@ class ApiMixin:
             self.respond(400, {"error": str(error)})
             return
         try:
+            if endpoint == "firebase-login":
+                self.firebase_login(body); return
+            if endpoint == "firebase-config":
+                self.firebase_config(); return
+            if endpoint == "phone-verify":
+                self.verify_phone_code(body); return
             self.perform(endpoint, method, body)
         except Exception as error:
             print(f"[Daybook] API error on {endpoint}: {type(error).__name__}: {error}")
@@ -268,7 +289,7 @@ class ApiMixin:
                 self.respond(400, {"error": "Name must be 32 characters or fewer."}); return
             name = name.strip()
             db.users.update_one({"_id": uid}, {"$set": {"name": name}})
-            self.respond(200, {"user": {"id": str(uid), "email": user["email"], "name": name}}); return
+            self.respond(200, {"user": {**public_user(user), "name": name}}); return
 
         if endpoint == "prayers":
             prayer_date, prayer, prayed = body.get("date"), body.get("prayer"), body.get("prayed")
@@ -298,6 +319,84 @@ class ApiMixin:
         expiry = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
         db.sessions.insert_one({"token_hash": token_hash(token), "user_id": user["_id"], "expires_at": expiry})
         self.respond(status, {"user": public_user(user)}, self.session_cookie(token, int(expiry.timestamp())))
+
+    def firebase_config(self):
+        keys = {"apiKey": "FIREBASE_API_KEY", "authDomain": "FIREBASE_AUTH_DOMAIN", "projectId": "FIREBASE_PROJECT_ID", "appId": "FIREBASE_APP_ID"}
+        config = {key: os.environ.get(env, "") for key, env in keys.items()}
+        if not all(config.values()):
+            self.respond(503, {"error": "Firebase sign-in is not configured yet."}); return
+        self.respond(200, {"config": config})
+
+    def firebase_identity(self, body):
+        id_token = body.get("idToken")
+        api_key = os.environ.get("FIREBASE_API_KEY")
+        if not isinstance(id_token, str) or not id_token or len(id_token) > 8192:
+            self.respond(400, {"error": "Complete Firebase sign-in and try again."}); return None
+        if not api_key:
+            self.respond(503, {"error": "Firebase sign-in is not configured yet."}); return None
+        try:
+            result = self.provider_request("https://identitytoolkit.googleapis.com/v1/accounts:lookup?" + urlencode({"key": api_key}), json.dumps({"idToken": id_token}).encode(), {"Content-Type": "application/json"})
+        except ValueError:
+            self.respond(401, {"error": "Firebase sign-in expired or could not be confirmed. Please try again."}); return None
+        firebase_users = result.get("users", [])
+        if len(firebase_users) != 1 or not firebase_users[0].get("localId"):
+            self.respond(401, {"error": "Firebase sign-in could not be confirmed. Please try again."}); return None
+        return firebase_users[0]
+
+    def verify_phone_code(self, body):
+        firebase_user = self.firebase_identity(body)
+        if not firebase_user:
+            return
+        if not re.fullmatch(r"\+[1-9]\d{7,14}", str(firebase_user.get("phoneNumber", ""))):
+            self.respond(401, {"error": "Phone sign-in could not be confirmed. Please try again."}); return
+        phone, firebase_uid = firebase_user["phoneNumber"], firebase_user["localId"]
+        db = database()
+        user = db.users.find_one({"firebase_uid": firebase_uid}) or db.users.find_one({"phone": phone})
+        if not user:
+            synthetic_email = "phone+" + hashlib.sha256(phone.encode()).hexdigest() + "@phone.daybook.invalid"
+            try:
+                result = db.users.insert_one({"email": synthetic_email, "phone": phone, "firebase_uid": firebase_uid, "name": "", "created_at": datetime.now(timezone.utc)})
+                user = db.users.find_one({"_id": result.inserted_id})
+            except DuplicateKeyError:
+                user = db.users.find_one({"firebase_uid": firebase_uid}) or db.users.find_one({"phone": phone})
+        elif not user.get("firebase_uid"):
+            db.users.update_one({"_id": user["_id"], "firebase_uid": {"$exists": False}}, {"$set": {"firebase_uid": firebase_uid}})
+            user = db.users.find_one({"_id": user["_id"]})
+        if not user:
+            self.respond(409, {"error": "Could not create your account. Please try again."}); return
+        self.create_session(db, user, 200)
+
+    def firebase_login(self, body):
+        firebase_user = self.firebase_identity(body)
+        if not firebase_user:
+            return
+        email = str(firebase_user.get("email", "")).strip().lower()
+        providers = firebase_user.get("providerUserInfo", [])
+        google_signin = any(provider.get("providerId") == "google.com" for provider in providers)
+        if not google_signin or firebase_user.get("emailVerified") is not True or not email:
+            self.respond(401, {"error": "Verified Google sign-in could not be confirmed."}); return
+        uid = firebase_user["localId"]
+        db = database()
+        user = db.users.find_one({"firebase_uid": uid}) or db.users.find_one({"email": email})
+        if user:
+            if user.get("firebase_uid") and user["firebase_uid"] != uid:
+                self.respond(409, {"error": "This email belongs to a different sign-in account."}); return
+            db.users.update_one({"_id": user["_id"], "firebase_uid": {"$exists": False}}, {"$set": {"firebase_uid": uid, "name": user.get("name") or str(firebase_user.get("displayName", ""))[:32]}})
+            user = db.users.find_one({"_id": user["_id"]})
+        else:
+            try:
+                inserted = db.users.insert_one({"email": email, "firebase_uid": uid, "name": str(firebase_user.get("displayName", ""))[:32], "created_at": datetime.now(timezone.utc)})
+                user = db.users.find_one({"_id": inserted.inserted_id})
+            except DuplicateKeyError:
+                user = db.users.find_one({"firebase_uid": uid}) or db.users.find_one({"email": email})
+        if not user:
+            self.respond(409, {"error": "Could not create your account. Please try again."}); return
+        if user.get("firebase_uid") != uid:
+            db.users.update_one({"_id": user["_id"], "firebase_uid": {"$exists": False}}, {"$set": {"firebase_uid": uid}})
+            user = db.users.find_one({"_id": user["_id"]})
+        if user.get("firebase_uid") != uid:
+            self.respond(409, {"error": "This email belongs to a different sign-in account."}); return
+        self.create_session(db, user, 200)
 
 
 class handler(ApiMixin, BaseHTTPRequestHandler):

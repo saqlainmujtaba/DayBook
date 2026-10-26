@@ -28,7 +28,7 @@ Set the same Atlas values in PowerShell, then start the local web server:
 ```powershell
 $env:MONGODB_URI = 'your Atlas connection string'
 $env:MONGODB_DB = 'daybook'
-python server.py
+python local_server.py
 ```
 
 Open <http://127.0.0.1:8000>.

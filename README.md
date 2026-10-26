@@ -7,7 +7,7 @@ A personal prayer and Quran tilawat tracker. The UI is static HTML/CSS/JavaScrip
 1. Push this project to a GitHub repository.
 2. In MongoDB Atlas, create a free cluster, create a database user with read/write access to the `daybook` database, and configure the Atlas IP access list for your Vercel app. Vercel has dynamic outbound IPs by default; fixed egress IPs are a paid Vercel feature. If you use `0.0.0.0/0` as a Hobby-plan workaround, it allows connections from anywhere, so use a generated strong password and a database user limited to read/write access on `daybook`. Atlas warns that `/0` can expose the deployment to unauthorized access.
 3. Copy the Atlas application connection string. Replace its password placeholder with the database user's password.
-4. In Vercel, import the GitHub repository as a project. `vercel.json` selects the **Other** framework preset so Vercel deploys the `api/*.py` files as separate functions and serves the frontend files statically. Vercel installs PyMongo from `requirements.txt`.
+4. In Vercel, import the GitHub repository as a project. `vercel.json` selects the **Other** framework preset, rewrites the API URLs to one Python function (to stay within the Hobby function limit), and serves the frontend files statically. Vercel installs PyMongo from `requirements.txt`.
 5. In the Vercel project settings, add these environment variables for **Production**, **Preview**, and **Development** as needed:
    - `MONGODB_URI` — the Atlas connection string. Keep it secret.
    - `MONGODB_DB` — `daybook` (optional; this is the default).

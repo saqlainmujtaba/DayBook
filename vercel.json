@@ -1,4 +1,19 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": null
+  "framework": null,
+  "rewrites": [
+    { "source": "/api/data", "destination": "/api/router?endpoint=data" },
+    { "source": "/api/export", "destination": "/api/router?endpoint=export" },
+    { "source": "/api/firebase-config", "destination": "/api/router?endpoint=firebase-config" },
+    { "source": "/api/firebase-login", "destination": "/api/router?endpoint=firebase-login" },
+    { "source": "/api/login", "destination": "/api/router?endpoint=login" },
+    { "source": "/api/logout", "destination": "/api/router?endpoint=logout" },
+    { "source": "/api/me", "destination": "/api/router?endpoint=me" },
+    { "source": "/api/phone-verify", "destination": "/api/router?endpoint=phone-verify" },
+    { "source": "/api/prayers", "destination": "/api/router?endpoint=prayers" },
+    { "source": "/api/profile", "destination": "/api/router?endpoint=profile" },
+    { "source": "/api/register-code", "destination": "/api/router?endpoint=register-code" },
+    { "source": "/api/register-verify", "destination": "/api/router?endpoint=register-verify" },
+    { "source": "/api/sessions", "destination": "/api/router?endpoint=sessions" }
+  ]
 }
